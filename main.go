@@ -3,13 +3,11 @@ package main
 import (
 	"fmt"
 	"log"
-	"math/rand"
 	"net/http"
 	"os"
 	"time"
 )
 
-// Entry is the schema of records
 type Entry struct {
 	Email        string
 	FirstName    string
@@ -25,13 +23,11 @@ type Entry struct {
 }
 
 func main() {
-	// Doing the seeding out of habit ;)
-	rand.Seed(time.Now().UnixNano())
+	loadConfig()
+	initDB()
 
 	http.HandleFunc("/meet-greet/register", RegistrationHandler)
 	http.HandleFunc("/internal/reports", ReportsHandler)
-
-	// Health and miscellaneous APIs
 	http.HandleFunc("/status", StatusHandler)
 	http.HandleFunc("/ping", PingHandler)
 
@@ -41,6 +37,15 @@ func main() {
 		log.Printf("Defaulting to port %s", port)
 	}
 
+	// FIX M-5: configure server timeouts to prevent Slowloris-style attacks
+	// and resource exhaustion from slow or idle clients.
+	srv := &http.Server{
+		Addr:         fmt.Sprintf(":%s", port),
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
 	log.Printf("Listening on port %s", port)
-	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%s", port), nil))
+	log.Fatal(srv.ListenAndServe())
 }

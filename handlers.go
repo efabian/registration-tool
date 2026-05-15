@@ -2,8 +2,8 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"crypto/md5"
+	"crypto/subtle"
 	"fmt"
 	"html/template"
 	"log"
@@ -12,9 +12,13 @@ import (
 	"strings"
 	"time"
 
-	"cloud.google.com/go/datastore"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
 	"gopkg.in/gomail.v2"
 )
+
+// titler is used to replace the deprecated strings.Title.
+var titler = cases.Title(language.Und)
 
 type templateTags struct {
 	FName    string
@@ -29,193 +33,107 @@ type templateTags struct {
 	ZDate    string
 }
 
-type secrets struct {
-	ID       int    `datastore:"ID"`
-	API      string `datastore:"api"`
-	Key      string `datastore:"key"`
-	Passcode string `datastore:"passcode"`
-	SMTP     string `datastore:"smtp"`
-	Sender   string `datastore:"sender"`
-	BCC      string `datastore:"bcc"`
-	BCCnick  string `datastore:"bccnick"`
-	Subject  string `datastore:"subject"`
-	Link     string `datastore:"zlink"`
-	Meet     string `datastore:"zmeet"`
-	Pass     string `datastore:"zpass"`
-	Date     string `datastore:"zdate"`
-	QR       string `datastore:"zqr"`
-}
-
-const projectID string = "hk-thai-kadiwa"
-
-// TimeSalt for the Ping Handler
-const TimeSalt string = "LMjKASwwzUvFQwtr8jmFrjKXeBQQ3LzC"
-
+// render parses and executes a template, writing the result to w.
+// On error it writes a 500 response and returns.
 func render(w http.ResponseWriter, filename string, data interface{}) {
 	tmpl, err := template.ParseFiles(filename)
 	if err != nil {
 		log.Println(err)
 		http.Error(w, "Sorry, something went wrong", http.StatusInternalServerError)
+		return
 	}
-
 	if err := tmpl.Execute(w, data); err != nil {
 		log.Println(err)
 		http.Error(w, "Sorry, something went wrong", http.StatusInternalServerError)
+		return // FIX M-2: was missing; prevents partial-write + double-header confusion
 	}
 }
 
-func retrieveSecrets() (secretsQuery []secrets) {
-	ctx := context.Background()
-
-	client, err := datastore.NewClient(ctx, projectID)
-	if err != nil {
-		log.Fatalf("Failed to create client: %v", err)
-	}
-
-	q := datastore.NewQuery("Secrets").
-		Filter("ID <", 7).
-		Limit(6)
-
-	if _, err := client.GetAll(ctx, q, &secretsQuery); err != nil {
-		log.Fatalf("Failed to retrieve secrets: %v", err)
-	}
-	return secretsQuery
+// dayKey maps a lowercase day abbreviation to the uppercase key used in cfg.Zoom.
+func dayKey(day string) string {
+	return strings.ToUpper(day)
 }
 
-func record(details Entry) (ok bool) {
-	ctx := context.Background()
-
-	client, err := datastore.NewClient(ctx, projectID)
-	if err != nil {
-		log.Fatalf("Failed to create client: %v", err)
+// createMessage builds the HTML confirmation email body.
+// FIX M-1: now returns (string, error) so callers can handle failures.
+func createMessage(fname, lname, local, district, day string) (string, error) {
+	zoom, ok := cfg.Zoom[dayKey(day)]
+	if !ok {
+		log.Printf("no zoom config found for day %q", day)
+		zoom = ZoomConfig{}
 	}
 
-	kind := "Registrations"
-	key := details.Email
-	recordKey := datastore.NameKey(kind, key, nil)
-	record := details
-
-	if _, err := client.Put(ctx, recordKey, &record); err == nil {
-		ok = true
-	} else {
-		log.Fatalf("Failed to save entry: %v", err)
-		ok = false
-	}
-	return ok
-}
-
-func createMessage(fname string, lname string, local string, district string, day string) (message string) {
-	secrets := retrieveSecrets()
-	var i int
-	if day == "mon" {
-		i = 0
-	}
-	if day == "tue" {
-		i = 1
-	}
-	if day == "wed" {
-		i = 2
-	}
-	if day == "thu" {
-		i = 3
-	}
-	if day == "fri" {
-		i = 4
-	}
-	if day == "sat" {
-		i = 5
-	}
-
-	zqr := secrets[i].QR
-	zlink := secrets[i].Link
-	zmeet := secrets[i].Meet
-	zpass := secrets[i].Pass
-	zdate := secrets[i].Date
-
-	var time string
+	meetTime := "8:45PM"
 	if district == "HK" {
-		time = "9:45PM"
-	} else {
-		time = "8:45PM"
+		meetTime = "9:45PM"
 	}
 
-	var tags = templateTags{fname, lname, local, district, time, zqr, zlink, zmeet, zpass, zdate}
-	emailBody := template.New("emailtemplate.html")
+	tags := templateTags{
+		FName:    fname,
+		LName:    lname,
+		Local:    local,
+		District: district,
+		Time:     meetTime,
+		ZQR:      zoom.QR,
+		ZLink:    zoom.Link,
+		ZMeet:    zoom.Meet,
+		ZPass:    zoom.Pass,
+		ZDate:    zoom.Date,
+	}
 
+	emailBody := template.New("emailtemplate.html")
 	emailBody, err := emailBody.ParseFiles("templates/emailtemplate.html")
 	if err != nil {
-		log.Println(err)
+		return "", fmt.Errorf("parsing email template: %w", err)
 	}
-
-	//Declare template as buffer of bytes
 	var tpl bytes.Buffer
 	if err := emailBody.Execute(&tpl, tags); err != nil {
-		log.Println(err)
+		return "", fmt.Errorf("executing email template: %w", err)
 	}
-
-	return tpl.String()
+	return tpl.String(), nil
 }
 
-func sendEmail(email string, message string) (ok bool) {
-	secrets := retrieveSecrets()
-	smtpServ := secrets[0].SMTP
-	smtpPort := 587
-
-	sesAPI := secrets[0].API
-	sesKey := secrets[0].Key
-
-	sender := secrets[0].Sender
-	bcc := secrets[0].BCC
-	bccNickname := secrets[0].BCCnick
-	subject := secrets[0].Subject
+func sendEmail(email, message string) bool {
+	smtpPort, err := strconv.Atoi(cfg.SMTPPort)
+	if err != nil {
+		log.Printf("invalid SMTP_PORT %q: %v; defaulting to 587", cfg.SMTPPort, err)
+		smtpPort = 587
+	}
 
 	mailParam := gomail.NewMessage()
-	mailParam.SetHeader("From", sender)
+	mailParam.SetHeader("From", cfg.EmailSender)
 	mailParam.SetHeader("To", email)
-	mailParam.SetAddressHeader("Bcc", bcc, bccNickname)
-	mailParam.SetHeader("Subject", subject)
+	mailParam.SetAddressHeader("Bcc", cfg.EmailBCC, cfg.EmailBCCNick)
+	mailParam.SetHeader("Subject", cfg.EmailSubject)
 	mailParam.SetBody("text/html", message)
 
-	send := gomail.NewDialer(smtpServ, smtpPort, sesAPI, sesKey)
-
+	send := gomail.NewDialer(cfg.SMTPHost, smtpPort, cfg.SMTPUser, cfg.SMTPPass)
 	if err := send.DialAndSend(mailParam); err != nil {
-		ok = false
-	} else {
-		ok = true
+		log.Printf("failed to send email to %q: %v", email, err)
+		return false
 	}
-	return ok
+	return true
 }
 
+// getHandler serves the registration form for GET requests.
+// FIX M-6: returns 405 for any other method instead of an empty 200.
 func getHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
 		render(w, "templates/form.html", nil)
+		return
 	}
+	http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 }
 
-func checkSize(day string) (size int) {
-	ctx := context.Background()
-
-	client, err := datastore.NewClient(ctx, projectID)
-	if err != nil {
-		log.Fatalf("Failed to create client: %v", err)
-	}
-
-	q := datastore.NewQuery("Registrations").Filter("PreferredDay =", day)
-
-	if size, err = client.Count(ctx, q); err != nil {
-		log.Fatalf("Failed to retrieve records: %v", err)
-	}
-	log.Println(size)
-	return size
-}
-
-// RegistrationHandler adds new record in the database
 func RegistrationHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		getHandler(w, r)
 		return
 	}
 
+	// FIX M-3: parse all form values once into msg; validatedInputs will be
+	// built from msg fields (not re-read from r) so that transformations
+	// (e.g. overbooked override, ToLower on email) are consistently applied.
 	msg := &Inputs{
 		Email:        strings.ToLower(r.FormValue("email")),
 		FirstName:    r.PostFormValue("fname"),
@@ -230,95 +148,88 @@ func RegistrationHandler(w http.ResponseWriter, r *http.Request) {
 		PreferredDay: r.PostFormValue("prefday"),
 	}
 
+	// FIX C-5 (partial): the overbooked flag is set on msg.PreferredDay so
+	// that Validate() catches it AND validatedInputs below uses the same value.
 	size := checkSize(msg.PreferredDay)
-
 	if size > 85 {
 		msg.PreferredDay = "overbooked"
 	}
 
-	if msg.Validate() == false {
+	if !msg.Validate() {
 		render(w, "templates/form.html", msg)
 		return
 	}
 
+	// Build Entry from the already-parsed and transformed msg fields.
 	validatedInputs := Entry{
-		Email:        strings.ToLower(r.FormValue("email")),
-		FirstName:    strings.Title(strings.ToLower(r.FormValue("fname"))),
-		LastName:     strings.Title(strings.ToLower(r.FormValue("lname"))),
-		Area:         r.FormValue("area"),
-		Group:        r.FormValue("group"),
-		Function:     strings.Title(r.FormValue("function")),
-		Gender:       r.FormValue("gender"),
-		Local:        strings.Title(r.FormValue("local")),
-		District:     strings.ToUpper(r.FormValue("district")),
-		Status:       r.FormValue("status"),
-		PreferredDay: r.FormValue("prefday"),
+		Email:        msg.Email,
+		FirstName:    titler.String(strings.ToLower(msg.FirstName)),
+		LastName:     titler.String(strings.ToLower(msg.LastName)),
+		Area:         msg.Area,
+		Group:        msg.Group,
+		Function:     titler.String(msg.Function),
+		Gender:       msg.Gender,
+		Local:        titler.String(msg.Local),
+		District:     strings.ToUpper(msg.District),
+		Status:       msg.Status,
+		PreferredDay: msg.PreferredDay, // uses the (possibly "overbooked") value from msg
 	}
 
-	recorded := record(validatedInputs)
-
-	if recorded {
-		createdMessage := createMessage(validatedInputs.FirstName, validatedInputs.LastName, validatedInputs.Local, validatedInputs.District, validatedInputs.PreferredDay)
-		sentEmail := sendEmail(validatedInputs.Email, createdMessage)
-
-		if sentEmail {
-			render(w, "templates/confirmation.html", nil)
-		} else {
-			render(w, "templates/sendingfailure.html", nil)
-		}
-	} else {
+	if !record(validatedInputs) {
 		render(w, "templates/registrationfailure.html", nil)
+		return
 	}
-}
 
-func retrieveRecords() (entriesQuery []Entry) {
-	ctx := context.Background()
-
-	client, err := datastore.NewClient(ctx, projectID)
+	// FIX M-1: handle template errors from createMessage.
+	createdMessage, err := createMessage(
+		validatedInputs.FirstName,
+		validatedInputs.LastName,
+		validatedInputs.Local,
+		validatedInputs.District,
+		validatedInputs.PreferredDay,
+	)
 	if err != nil {
-		log.Fatalf("Failed to create client: %v", err)
+		log.Printf("failed to create confirmation email for %q: %v", validatedInputs.Email, err)
+		render(w, "templates/sendingfailure.html", nil)
+		return
 	}
 
-	q := datastore.NewQuery("Registrations")
-
-	if _, err := client.GetAll(ctx, q, &entriesQuery); err != nil {
-		log.Fatalf("Failed to retrieve records: %v", err)
+	if sendEmail(validatedInputs.Email, createdMessage) {
+		render(w, "templates/confirmation.html", nil)
+	} else {
+		render(w, "templates/sendingfailure.html", nil)
 	}
-	return entriesQuery
 }
 
-// ReportsHandler retrieves the records from the database
 func ReportsHandler(w http.ResponseWriter, r *http.Request) {
-
 	if r.Method != http.MethodPost {
 		render(w, "templates/reports.html", nil)
 		return
 	}
 
-	secrets := retrieveSecrets()
-
-	passcode := secrets[0].Passcode
-
 	userInput := r.PostFormValue("passcode")
-
-	if userInput != passcode {
+	// FIX C-2: use constant-time comparison to prevent timing attacks.
+	if subtle.ConstantTimeCompare([]byte(userInput), []byte(cfg.AdminPasscode)) != 1 {
 		render(w, "templates/incorrectpassword.html", nil)
 		return
 	}
 
 	records := retrieveRecords()
 	render(w, "templates/records.html", records)
-
 }
 
-// StatusHandler provides basic health check
 func StatusHandler(w http.ResponseWriter, r *http.Request) {
+	// FIX m-5: set explicit Content-Type.
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	fmt.Fprintf(w, "Alive and well :)")
 }
 
-// PingHandler provides basic Health check and timestamp
 func PingHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain ")
+	// FIX C-3: salt is now loaded from PING_SALT env var (see config.go).
+	// FIX m-4: removed trailing space from Content-Type value.
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	now := strconv.FormatInt(time.Now().Unix(), 10)
-	w.Write([]byte(now + fmt.Sprintf("%x", md5.Sum([]byte(now+TimeSalt)))))
+	// MD5 is used here only as a non-cryptographic uptime token, not for
+	// security. The salt is loaded from env so it is no longer committed to source.
+	w.Write([]byte(now + fmt.Sprintf("%x", md5.Sum([]byte(now+cfg.PingSalt)))))
 }
